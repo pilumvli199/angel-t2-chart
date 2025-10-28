@@ -387,65 +387,96 @@ def get_current_ltp(smartApi, token, exchange):
         return None
 
 def get_historical_candles_with_current(smartApi, symbol, token, exchange):
-    """Fetch last 500 candles + current live candle"""
+    """Fetch intraday + historical candles + current live candle"""
     try:
         logger.info(f"📊 Fetching candles for {symbol}...")
         
-        # Get historical candles
-        to_date = datetime.now()
-        from_date = to_date - timedelta(days=30)
+        now = datetime.now()
+        all_candles = []
         
-        params = {
+        # STEP 1: Get today's intraday candles (9:15 AM to current time)
+        today_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        if now > today_start:
+            try:
+                params_today = {
+                    "exchange": exchange,
+                    "symboltoken": token,
+                    "interval": "FIFTEEN_MINUTE",
+                    "fromdate": today_start.strftime("%Y-%m-%d %H:%M"),
+                    "todate": now.strftime("%Y-%m-%d %H:%M")
+                }
+                
+                response_today = smartApi.getCandleData(params_today)
+                
+                if response_today and response_today.get('status'):
+                    today_candles = response_today.get('data', [])
+                    logger.info(f"✅ Got {len(today_candles)} today's candles for {symbol}")
+                    all_candles.extend(today_candles)
+            except Exception as e:
+                logger.warning(f"Could not fetch today's candles: {e}")
+        
+        # STEP 2: Get last 30 days historical candles (excluding today)
+        yesterday = now - timedelta(days=1)
+        from_date = now - timedelta(days=30)
+        
+        params_historical = {
             "exchange": exchange,
             "symboltoken": token,
             "interval": "FIFTEEN_MINUTE",
             "fromdate": from_date.strftime("%Y-%m-%d 09:15"),
-            "todate": to_date.strftime("%Y-%m-%d %H:%M")
+            "todate": yesterday.strftime("%Y-%m-%d 15:30")
         }
         
-        response = smartApi.getCandleData(params)
+        response_hist = smartApi.getCandleData(params_historical)
         
-        if response and response.get('status'):
-            candles = response.get('data', [])
-            logger.info(f"✅ Got {len(candles)} historical candles for {symbol}")
+        if response_hist and response_hist.get('status'):
+            hist_candles = response_hist.get('data', [])
+            logger.info(f"✅ Got {len(hist_candles)} historical candles for {symbol}")
             
-            # Convert to DataFrame
-            df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            
-            # Take last 499 (to make room for current candle)
-            if len(df) > 499:
-                df = df.tail(499)
-            
-            # NOW ADD CURRENT LIVE CANDLE
-            try:
-                current_ltp = get_current_ltp(smartApi, token, exchange)
-                if current_ltp:
-                    now = datetime.now()
-                    
-                    # Get last candle for reference
-                    last_candle = df.iloc[-1] if len(df) > 0 else None
-                    
-                    # Create current candle
+            # Combine historical + today's candles
+            all_candles = hist_candles + all_candles
+        
+        if not all_candles:
+            logger.warning(f"No candle data for {symbol}")
+            return None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Remove duplicates and sort
+        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+        
+        # Take last 499 (to make room for current candle)
+        if len(df) > 499:
+            df = df.tail(499)
+        
+        logger.info(f"✅ Total candles: {len(df)} for {symbol}")
+        
+        # STEP 3: ADD CURRENT LIVE CANDLE
+        try:
+            current_ltp = get_current_ltp(smartApi, token, exchange)
+            if current_ltp:
+                last_candle = df.iloc[-1] if len(df) > 0 else None
+                last_timestamp = last_candle['timestamp'] if last_candle is not None else now
+                
+                # Only add if current time is significantly after last candle
+                if (now - last_timestamp).total_seconds() > 60:
                     current_candle = {
                         'timestamp': now,
                         'open': last_candle['close'] if last_candle is not None else current_ltp,
                         'high': current_ltp,
                         'low': current_ltp,
                         'close': current_ltp,
-                        'volume': 0  # Volume not available for live candle
+                        'volume': 0
                     }
                     
-                    # Append to dataframe
                     df = pd.concat([df, pd.DataFrame([current_candle])], ignore_index=True)
                     logger.info(f"✅ Added current candle: LTP={current_ltp}")
-            except Exception as e:
-                logger.warning(f"Could not add current candle: {e}")
-            
-            return df
-        else:
-            logger.warning(f"No candle data for {symbol}: {response}")
-            return None
+        except Exception as e:
+            logger.warning(f"Could not add current candle: {e}")
+        
+        return df
     except Exception as e:
         logger.exception(f"Failed to fetch candles: {e}")
         return None
