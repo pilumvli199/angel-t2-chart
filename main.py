@@ -186,7 +186,7 @@ def download_instruments(smartApi):
         return None
 
 def find_nearest_expiry(instruments, symbol, exch_seg, name_in_inst):
-    """Find nearest available expiry"""
+    """Find nearest available expiry (including today if not expired yet)"""
     try:
         expiries = set()
         for inst in instruments:
@@ -197,28 +197,45 @@ def find_nearest_expiry(instruments, symbol, exch_seg, name_in_inst):
             logger.warning(f"No expiries for {symbol}")
             return None
         
-        today = datetime.now()
+        now = datetime.now()
+        # Consider expiry valid until 3:30 PM on expiry day
+        cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
         future_expiries = []
         
         for exp_str in expiries:
             try:
+                exp_date = None
                 for fmt in ['%d%b%Y', '%d%b%y']:
                     try:
                         exp_date = datetime.strptime(exp_str, fmt)
-                        if exp_date >= today:
-                            future_expiries.append((exp_date, exp_str))
                         break
                     except:
                         continue
+                
+                if exp_date:
+                    # Set expiry time to 3:30 PM
+                    exp_datetime = exp_date.replace(hour=15, minute=30, second=0, microsecond=0)
+                    
+                    # Include if expiry hasn't passed yet
+                    if exp_datetime >= now:
+                        future_expiries.append((exp_datetime, exp_str))
             except:
                 continue
         
         if not future_expiries:
+            logger.warning(f"No future expiries for {symbol}")
             return None
         
         future_expiries.sort()
         nearest = future_expiries[0][1]
-        logger.info(f"📅 {symbol}: {nearest}")
+        nearest_date = future_expiries[0][0]
+        
+        # Check if today's expiry
+        is_today = nearest_date.date() == now.date()
+        time_suffix = " (TODAY)" if is_today else ""
+        
+        logger.info(f"📅 {symbol}: {nearest}{time_suffix}")
         return nearest
     except Exception as e:
         logger.exception(f"Error finding expiry: {e}")
@@ -609,18 +626,37 @@ def bot_loop():
         logger.error("No instruments")
         return
     
-    # Find expiries
+    iteration = 0
+    last_expiry_check = 0
+    expiry_check_interval = 3600  # Re-check expiries every hour
+    
+    # Initial expiry discovery
     expiries = {}
     for symbol, config in SYMBOLS_CONFIG.items():
         exp = find_nearest_expiry(instruments, symbol, config['exch_seg'], config['name_in_instruments'])
         if exp:
             expiries[symbol] = exp
     
-    iteration = 0
     while True:
         try:
             iteration += 1
             logger.info(f"\n{'='*50}\n🔄 Iteration #{iteration}\n{'='*50}")
+            
+            # Refresh expiries periodically (every hour) or if it's been a while
+            current_time = time.time()
+            if current_time - last_expiry_check > expiry_check_interval:
+                logger.info("🔄 Refreshing expiries...")
+                for symbol, config in SYMBOLS_CONFIG.items():
+                    new_exp = find_nearest_expiry(instruments, symbol, config['exch_seg'], config['name_in_instruments'])
+                    if new_exp and new_exp != expiries.get(symbol):
+                        old_exp = expiries.get(symbol, 'None')
+                        expiries[symbol] = new_exp
+                        msg = f"📅 {symbol} expiry changed: {old_exp} → {new_exp}"
+                        logger.info(msg)
+                        tele_send_http(TELE_CHAT_ID, f"<b>{msg}</b>")
+                    elif new_exp:
+                        expiries[symbol] = new_exp
+                last_expiry_check = current_time
             
             spot_prices = get_spot_prices(smartApi)
             
@@ -672,7 +708,7 @@ def index():
         'service': 'Angel One Option Chain + Live Chart Bot',
         'bot_alive': thread.is_alive(),
         'symbols': list(SYMBOLS_CONFIG.keys()),
-        'features': ['Option Chain', 'Live Candlestick Charts', 'Real-time OI Tracking'],
+        'features': ['Option Chain', 'Live Candlestick Charts', 'Real-time OI Tracking', 'Auto Expiry Selection'],
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     })
 
